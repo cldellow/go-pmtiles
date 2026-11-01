@@ -2,7 +2,6 @@ package pmtiles
 
 import (
 	"bytes"
-	"compress/gzip"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -11,8 +10,13 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
+	"sync"
+	"time"
+
+	"github.com/klauspost/compress/gzip"
 )
 
 // Merging of MVT archives whose tiles overlap but whose layers are disjoint
@@ -115,17 +119,37 @@ func walkProtobuf(msg []byte, fn func(field uint64, value []byte) error) error {
 	return nil
 }
 
+// Merging recompresses most tiles, so reuse gzip state: allocating a fresh
+// writer per tile makes the merge spend most of its time in the allocator and GC.
+var gzipReaders sync.Pool
+var gzipWriters = sync.Pool{New: func() any {
+	w, _ := gzip.NewWriterLevel(io.Discard, gzip.DefaultCompression)
+	return w
+}}
+
 func decompressTile(data []byte, compression Compression) ([]byte, error) {
 	switch compression {
 	case NoCompression:
 		return data, nil
 	case Gzip:
-		r, err := gzip.NewReader(bytes.NewReader(data))
-		if err != nil {
+		var r *gzip.Reader
+		if v := gzipReaders.Get(); v != nil {
+			r = v.(*gzip.Reader)
+			if err := r.Reset(bytes.NewReader(data)); err != nil {
+				return nil, err
+			}
+		} else {
+			var err error
+			if r, err = gzip.NewReader(bytes.NewReader(data)); err != nil {
+				return nil, err
+			}
+		}
+		defer gzipReaders.Put(r)
+		out := bytes.NewBuffer(make([]byte, 0, 4*len(data)))
+		if _, err := out.ReadFrom(r); err != nil {
 			return nil, err
 		}
-		defer r.Close()
-		return io.ReadAll(r)
+		return out.Bytes(), nil
 	default:
 		c, _ := compressionToString(compression)
 		return nil, fmt.Errorf("tile compression %s not supported for layer merging", c)
@@ -138,11 +162,12 @@ func compressTile(data []byte, compression Compression) ([]byte, error) {
 		return data, nil
 	case Gzip:
 		var b bytes.Buffer
-		w, err := gzip.NewWriterLevel(&b, gzip.BestCompression)
-		if err != nil {
+		w := gzipWriters.Get().(*gzip.Writer)
+		defer gzipWriters.Put(w)
+		w.Reset(&b)
+		if _, err := w.Write(data); err != nil {
 			return nil, err
 		}
-		w.Write(data)
 		if err := w.Close(); err != nil {
 			return nil, err
 		}
@@ -153,23 +178,67 @@ func compressTile(data []byte, compression Compression) ([]byte, error) {
 	}
 }
 
-func vectorLayerIDs(metadata map[string]interface{}) ([]string, bool) {
-	layers, ok := metadata["vector_layers"].([]interface{})
-	if !ok {
-		return nil, false
-	}
-	var ids []string
+// dedupeLayers keeps the first of several layer objects with the same key
+// (e.g. "id" in vector_layers), widening its zoom range and adding any fields
+// that only later declarations have. Several inputs may declare the same layer
+// as long as they never put it in the same tile.
+func dedupeLayers(layers []interface{}, key string) []interface{} {
+	var result []interface{}
+	byID := make(map[string]map[string]interface{})
 	for _, l := range layers {
-		if m, ok := l.(map[string]interface{}); ok {
-			if id, ok := m["id"].(string); ok {
-				ids = append(ids, id)
+		m, ok := l.(map[string]interface{})
+		if !ok {
+			result = append(result, l)
+			continue
+		}
+		id, ok := m[key].(string)
+		if !ok {
+			result = append(result, l)
+			continue
+		}
+		first, seen := byID[id]
+		if !seen {
+			copied := make(map[string]interface{}, len(m))
+			for k, v := range m {
+				copied[k] = v
+			}
+			byID[id] = copied
+			result = append(result, copied)
+			continue
+		}
+		if z, ok := m["minzoom"].(float64); ok {
+			if fz, ok := first["minzoom"].(float64); !ok || z < fz {
+				first["minzoom"] = z
 			}
 		}
+		if z, ok := m["maxzoom"].(float64); ok {
+			if fz, ok := first["maxzoom"].(float64); !ok || z > fz {
+				first["maxzoom"] = z
+			}
+		}
+		if fields, ok := m["fields"].(map[string]interface{}); ok {
+			firstFields, ok := first["fields"].(map[string]interface{})
+			if !ok {
+				firstFields = make(map[string]interface{})
+			} else {
+				copied := make(map[string]interface{}, len(firstFields))
+				for k, v := range firstFields {
+					copied[k] = v
+				}
+				firstFields = copied
+			}
+			for k, v := range fields {
+				if _, ok := firstFields[k]; !ok {
+					firstFields[k] = v
+				}
+			}
+			first["fields"] = firstFields
+		}
 	}
-	return ids, true
+	return result
 }
 
-// mergeLayerMetadata copies the first input's metadata, concatenating vector_layers
+// mergeLayerMetadata copies the first input's metadata, combining vector_layers
 // and tilestats.layers across all inputs.
 func mergeLayerMetadata(metadatas []map[string]interface{}) map[string]interface{} {
 	result := make(map[string]interface{})
@@ -184,7 +253,7 @@ func mergeLayerMetadata(metadatas []map[string]interface{}) map[string]interface
 		}
 	}
 	if vectorLayers != nil {
-		result["vector_layers"] = vectorLayers
+		result["vector_layers"] = dedupeLayers(vectorLayers, "id")
 	}
 
 	var statLayers []interface{}
@@ -203,6 +272,7 @@ func mergeLayerMetadata(metadatas []map[string]interface{}) map[string]interface
 		statLayers = append(statLayers, l...)
 	}
 	if allHaveStats {
+		statLayers = dedupeLayers(statLayers, "layer")
 		result["tilestats"] = map[string]interface{}{
 			"layerCount": len(statLayers),
 			"layers":     statLayers,
@@ -263,17 +333,9 @@ func loadLayerMergeInputs(readers []io.ReaderAt) ([]*layerMergeInput, error, int
 		inputs = append(inputs, &layerMergeInput{reader: r, header: h, metadata: metadata, entries: entries})
 	}
 
-	// fail fast if the declared layers overlap. tiles are checked individually during the merge.
-	seen := make(map[string]int)
-	for idx, in := range inputs {
-		ids, _ := vectorLayerIDs(in.metadata)
-		for _, id := range ids {
-			if other, ok := seen[id]; ok && other != idx {
-				return nil, fmt.Errorf("vector layer %q is also present in input %d; layers must be disjoint", id, other+1), idx
-			}
-			seen[id] = idx
-		}
-	}
+	// Several inputs may declare the same layer (e.g. a layer split across two
+	// tilemaker configs by area), so the metadata isn't checked here. Each
+	// combined tile is checked for a layer coming from two inputs instead.
 	return inputs, nil, 0
 }
 
@@ -322,6 +384,226 @@ func readTile(in *layerMergeInput, e EntryV3) ([]byte, error) {
 	return b, err
 }
 
+// A run of tile IDs to emit, and the source tiles that make it up.
+type mergeJob struct {
+	seg   layerSegment
+	ents  []EntryV3 // the covering entry of each source, in seg.sources order
+	id    uint32    // index of this output tile's contents, in production order
+	isNew bool      // whether this job produces id (else it reuses an earlier job's)
+	data  []byte    // the output tile; nil if it's empty
+	err   error
+	done  chan struct{}
+}
+
+type mergeStats struct {
+	bytes, addressed, combined, empty uint64
+}
+
+// noTile marks contents that turned out to be empty, and so aren't written.
+var noTile = offsetLen{Offset: math.MaxUint64}
+
+// buildTile reads a job's source tiles and produces its output tile.
+func buildTile(inputs []*layerMergeInput, names []string, compression Compression, j *mergeJob) ([]byte, error) {
+	if len(j.seg.sources) == 1 {
+		raw, err := readTile(inputs[j.seg.sources[0]], j.ents[0])
+		if err != nil {
+			return nil, err
+		}
+		// tilemaker writes empty tiles, which gzip to ~20 bytes. Drop them, as
+		// tile-join and tile-smush do.
+		if len(raw) < 64 {
+			part, err := decompressTile(raw, compression)
+			if err != nil {
+				return nil, fmt.Errorf("%s: %w", names[j.seg.sources[0]], err)
+			}
+			if len(part) == 0 {
+				return nil, nil
+			}
+		}
+		return raw, nil
+	}
+
+	// An MVT Tile is a list of layers, so concatenating tiles merges them.
+	var combined []byte
+	var layerOwner map[string]int
+	for i, idx := range j.seg.sources {
+		raw, err := readTile(inputs[idx], j.ents[i])
+		if err != nil {
+			return nil, err
+		}
+		part, err := decompressTile(raw, compression)
+		if err != nil {
+			return nil, fmt.Errorf("%s: %w", names[idx], err)
+		}
+		layerNames, err := mvtLayerNames(part)
+		if err != nil {
+			z, x, y := IDToZxy(j.seg.start)
+			return nil, fmt.Errorf("%s: tile %d %d %d: %w", names[idx], z, x, y, err)
+		}
+		if layerOwner == nil {
+			layerOwner = make(map[string]int, 8)
+		}
+		for _, name := range layerNames {
+			if other, ok := layerOwner[name]; ok {
+				z, x, y := IDToZxy(j.seg.start)
+				return nil, fmt.Errorf("layer %q appears in both %s and %s at tile %d %d %d; layers must be disjoint", name, names[other], names[idx], z, x, y)
+			}
+			layerOwner[name] = idx
+		}
+		combined = append(combined, part...)
+	}
+	if len(combined) == 0 {
+		return nil, nil
+	}
+	return compressTile(combined, compression)
+}
+
+// mergeSegments writes the merged tile data to tileData in tile ID order, and
+// returns its directory entries and the number of unique tiles written.
+//
+// One goroutine walks the inputs in tile ID order and hands out jobs; workers
+// read, combine and compress tiles in parallel; this goroutine writes their
+// results in the order the jobs were made.
+//
+// Output tiles are deduplicated by the source tiles they're built from (not by
+// content), so no tile needs hashing: tilemaker already dedupes identical tiles
+// within each input, e.g. the ocean.
+func mergeSegments(inputs []*layerMergeInput, names []string, compression Compression, workers int, tileData io.Writer) ([]EntryV3, uint64, mergeStats, error) {
+	var stats mergeStats
+	queue := make(chan *mergeJob, 64*workers) // bounds memory held by jobs in flight
+	work := make(chan *mergeJob, 64*workers)
+	abort := make(chan struct{})
+
+	var wg sync.WaitGroup
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := range work {
+				j.data, j.err = buildTile(inputs, names, compression, j)
+				close(j.done)
+			}
+		}()
+	}
+
+	go func() {
+		defer close(queue)
+		defer close(work)
+		// Keyed by (input, offset) for the common single-source case, which
+		// keeps this small for archives with tens of millions of tiles.
+		single := make(map[uint64]uint32)
+		multi := make(map[string]uint32)
+		var key []byte
+		var next uint32
+		t := uint64(0)
+		for {
+			seg, ok := nextSegment(inputs, t)
+			if !ok {
+				return
+			}
+			t = seg.end
+			j := &mergeJob{seg: seg, ents: make([]EntryV3, len(seg.sources)), done: make(chan struct{})}
+			for i, idx := range seg.sources {
+				j.ents[i] = inputs[idx].entries[inputs[idx].pos]
+			}
+
+			var id uint32
+			var seen bool
+			if len(seg.sources) == 1 && j.ents[0].Offset < 1<<56 {
+				k := uint64(seg.sources[0])<<56 | j.ents[0].Offset
+				if id, seen = single[k]; !seen {
+					id = next
+					single[k] = id
+				}
+			} else {
+				key = key[:0]
+				for i, idx := range seg.sources {
+					key = binary.AppendUvarint(key, uint64(idx))
+					key = binary.AppendUvarint(key, j.ents[i].Offset)
+				}
+				if id, seen = multi[string(key)]; !seen {
+					id = next
+					multi[string(key)] = id
+				}
+			}
+			j.id = id
+			if seen {
+				close(j.done)
+			} else {
+				j.isNew = true
+				next++
+				select {
+				case work <- j:
+				case <-abort:
+					return
+				}
+			}
+			select {
+			case queue <- j:
+			case <-abort:
+				return
+			}
+		}
+	}()
+
+	// locs[id] is where the contents with that id were written.
+	var locs []offsetLen
+	var entries []EntryV3
+	var contents uint64
+	var err error
+	for j := range queue {
+		<-j.done
+		if err == nil && j.err != nil {
+			err = j.err
+			close(abort)
+		}
+		if err != nil {
+			continue // drain, so the producer and workers can exit
+		}
+
+		runLength := j.seg.end - j.seg.start
+		if j.isNew {
+			loc := noTile
+			if j.data != nil {
+				if _, werr := tileData.Write(j.data); werr != nil {
+					err = werr
+					close(abort)
+					continue
+				}
+				loc = offsetLen{stats.bytes, uint32(len(j.data))}
+				stats.bytes += uint64(len(j.data))
+				contents++
+				if len(j.seg.sources) > 1 {
+					stats.combined += runLength
+				}
+			}
+			locs = append(locs, loc)
+			j.data = nil
+		}
+		loc := locs[j.id]
+		if loc == noTile {
+			stats.empty += runLength
+			continue
+		}
+
+		stats.addressed += runLength
+		if n := len(entries); n > 0 && entries[n-1].Offset == loc.Offset &&
+			entries[n-1].TileID+uint64(entries[n-1].RunLength) == j.seg.start &&
+			uint64(entries[n-1].RunLength)+runLength <= math.MaxUint32 {
+			entries[n-1].RunLength += uint32(runLength)
+		} else {
+			if runLength > math.MaxUint32 {
+				err = errors.New("maximum 32-bit run length exceeded")
+				close(abort)
+				continue
+			}
+			entries = append(entries, EntryV3{j.seg.start, loc.Offset, loc.Length, uint32(runLength)})
+		}
+	}
+	wg.Wait()
+	return entries, contents, stats, err
+}
+
 // mergeLayerTiles writes the merged tile data section to tileData, returning the output
 // header (without section offsets), merged metadata and directory entries.
 func mergeLayerTiles(logger *log.Logger, readers []io.ReaderAt, names []string, tileData io.Writer) (HeaderV3, map[string]interface{}, []EntryV3, error) {
@@ -348,92 +630,16 @@ func mergeLayerTiles(logger *log.Logger, readers []io.ReaderAt, names []string, 
 		logger.Printf("WARNING: inputs have different max zooms (%s); clients will not overzoom the lower ones", strings.Join(parts, ", "))
 	}
 
-	// output dedup is keyed by the tuple of source offsets that produced a tile.
-	written := make(map[string]offsetLen)
-	var entries []EntryV3
-	var offset uint64
-	var addressed uint64
-	var mergedTiles uint64
-	var key []byte
-
-	t := uint64(0)
-	for {
-		seg, ok := nextSegment(inputs, t)
-		if !ok {
-			break
-		}
-		t = seg.end
-
-		key = key[:0]
-		for _, idx := range seg.sources {
-			key = binary.AppendUvarint(key, uint64(idx))
-			key = binary.AppendUvarint(key, inputs[idx].entries[inputs[idx].pos].Offset)
-		}
-
-		loc, ok := written[string(key)]
-		if !ok {
-			var data []byte
-			if len(seg.sources) == 1 {
-				in := inputs[seg.sources[0]]
-				data, err = readTile(in, in.entries[in.pos])
-				if err != nil {
-					return header, nil, nil, err
-				}
-			} else {
-				var combined []byte
-				layerOwner := make(map[string]int)
-				for _, idx := range seg.sources {
-					in := inputs[idx]
-					raw, err := readTile(in, in.entries[in.pos])
-					if err != nil {
-						return header, nil, nil, err
-					}
-					part, err := decompressTile(raw, compression)
-					if err != nil {
-						return header, nil, nil, fmt.Errorf("%s: %w", names[idx], err)
-					}
-					layerNames, err := mvtLayerNames(part)
-					if err != nil {
-						z, x, y := IDToZxy(seg.start)
-						return header, nil, nil, fmt.Errorf("%s: tile %d %d %d: %w", names[idx], z, x, y, err)
-					}
-					for _, name := range layerNames {
-						if other, ok := layerOwner[name]; ok {
-							z, x, y := IDToZxy(seg.start)
-							return header, nil, nil, fmt.Errorf("layer %q appears in both %s and %s at tile %d %d %d; layers must be disjoint", name, names[other], names[idx], z, x, y)
-						}
-						layerOwner[name] = idx
-					}
-					combined = append(combined, part...)
-				}
-				data, err = compressTile(combined, compression)
-				if err != nil {
-					return header, nil, nil, err
-				}
-				mergedTiles += seg.end - seg.start
-			}
-
-			if _, err := tileData.Write(data); err != nil {
-				return header, nil, nil, err
-			}
-			loc = offsetLen{offset, uint32(len(data))}
-			written[string(key)] = loc
-			offset += uint64(len(data))
-		}
-
-		runLength := seg.end - seg.start
-		addressed += runLength
-		if n := len(entries); n > 0 && entries[n-1].Offset == loc.Offset &&
-			entries[n-1].TileID+uint64(entries[n-1].RunLength) == seg.start &&
-			uint64(entries[n-1].RunLength)+runLength <= math.MaxUint32 {
-			entries[n-1].RunLength += uint32(runLength)
-		} else {
-			if runLength > math.MaxUint32 {
-				return header, nil, nil, errors.New("maximum 32-bit run length exceeded")
-			}
-			entries = append(entries, EntryV3{seg.start, loc.Offset, loc.Length, uint32(runLength)})
-		}
+	start := time.Now()
+	entries, contents, stats, err := mergeSegments(inputs, names, compression, runtime.GOMAXPROCS(0), tileData)
+	if err != nil {
+		return header, nil, nil, err
 	}
+	if len(entries) == 0 {
+		return header, nil, nil, errors.New("merged archive has no tiles")
+	}
+	offset, addressed, mergedTiles := stats.bytes, stats.addressed, stats.combined
+	logger.Printf("Merged %d tiles (%d unique) in %v; dropped %d empty tiles", addressed, contents, time.Since(start).Round(time.Millisecond), stats.empty)
 
 	logger.Printf("Combined layers in %d overlapping tiles", mergedTiles)
 
@@ -451,7 +657,7 @@ func mergeLayerTiles(logger *log.Logger, readers []io.ReaderAt, names []string, 
 	header.TileDataLength = offset
 	header.AddressedTilesCount = addressed
 	header.TileEntriesCount = uint64(len(entries))
-	header.TileContentsCount = uint64(len(written))
+	header.TileContentsCount = contents
 	firstZ, _, _ := IDToZxy(entries[0].TileID)
 	last := entries[len(entries)-1]
 	lastZ, _, _ := IDToZxy(last.TileID + uint64(last.RunLength) - 1)

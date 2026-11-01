@@ -3,6 +3,7 @@ package pmtiles
 import (
 	"bytes"
 	"encoding/binary"
+	"fmt"
 	"io"
 	"log"
 	"os"
@@ -150,11 +151,125 @@ func TestMergeLayerTilesSplitsRuns(t *testing.T) {
 }
 
 func TestMergeLayerTilesDuplicateLayerInMetadata(t *testing.T) {
-	a := mvtArchive([]string{"water"}, map[Zxy][]byte{{0, 0, 0}: gzipMvt("water")})
-	b := mvtArchive([]string{"water"}, map[Zxy][]byte{{0, 0, 0}: gzipMvt("water")})
+	// Both inputs declare "parks", but never put it in the same tile.
+	a := mvtArchive([]string{"parks", "pois"}, map[Zxy][]byte{
+		{0, 0, 0}: gzipMvt("pois"),
+		{1, 0, 0}: gzipMvt("parks"),
+	})
+	b := mvtArchive([]string{"parks"}, map[Zxy][]byte{
+		{0, 0, 0}: gzipMvt("parks"),
+	})
 	logger := log.New(io.Discard, "", 0)
-	_, _, _, err := mergeLayerTiles(logger, []io.ReaderAt{bytes.NewReader(a), bytes.NewReader(b)}, []string{"a", "b"}, io.Discard)
-	assert.ErrorContains(t, err, `vector layer "water" is also present`)
+	_, md, entries, err := mergeLayerTiles(logger, []io.ReaderAt{bytes.NewReader(a), bytes.NewReader(b)}, []string{"a", "b"}, io.Discard)
+	assert.Nil(t, err)
+	assert.Equal(t, 2, len(entries))
+	var ids []string
+	for _, l := range md["vector_layers"].([]interface{}) {
+		ids = append(ids, l.(map[string]interface{})["id"].(string))
+	}
+	assert.Equal(t, []string{"parks", "pois"}, ids, "each layer is listed once")
+}
+
+func TestDedupeLayers(t *testing.T) {
+	layers := []interface{}{
+		map[string]interface{}{"id": "parks", "minzoom": 8.0, "maxzoom": 12.0, "fields": map[string]interface{}{"name": "String"}},
+		map[string]interface{}{"id": "pois"},
+		map[string]interface{}{"id": "parks", "minzoom": 6.0, "maxzoom": 14.0, "fields": map[string]interface{}{"name": "Number", "area": "Number"}},
+	}
+	result := dedupeLayers(layers, "id")
+	assert.Equal(t, 2, len(result))
+	parks := result[0].(map[string]interface{})
+	assert.Equal(t, 6.0, parks["minzoom"])
+	assert.Equal(t, 14.0, parks["maxzoom"])
+	assert.Equal(t, map[string]interface{}{"name": "String", "area": "Number"}, parks["fields"])
+	// the inputs are left alone
+	assert.Equal(t, 8.0, layers[0].(map[string]interface{})["minzoom"])
+	assert.Equal(t, 1, len(layers[0].(map[string]interface{})["fields"].(map[string]interface{})))
+}
+
+func TestMergeLayerTilesDropsEmptyTiles(t *testing.T) {
+	empty, _ := compressTile(nil, Gzip)
+	a := mvtArchive([]string{"water"}, map[Zxy][]byte{
+		{0, 0, 0}: empty,
+		{1, 0, 0}: empty,
+		{1, 0, 1}: gzipMvt("water"),
+	})
+	b := mvtArchive([]string{"roads"}, map[Zxy][]byte{
+		{1, 0, 0}: empty,
+		{1, 1, 1}: gzipMvt("roads"),
+	})
+	logger := log.New(io.Discard, "", 0)
+	header, _, entries, err := mergeLayerTiles(logger, []io.ReaderAt{bytes.NewReader(a), bytes.NewReader(b)}, []string{"a", "b"}, io.Discard)
+	assert.Nil(t, err)
+	assert.Equal(t, uint64(2), header.AddressedTilesCount)
+	assert.Equal(t, 2, len(entries))
+	assert.Equal(t, ZxyToID(1, 0, 1), entries[0].TileID)
+	assert.Equal(t, uint8(1), header.MinZoom)
+}
+
+// manyTileArchives makes three inputs with overlapping, partly repeated tiles at z0-6.
+func manyTileArchives() [][]byte {
+	layers := []string{"water", "roads", "pois"}
+	var archives [][]byte
+	for i, layer := range layers {
+		tiles := make(map[Zxy][]byte)
+		repeated := gzipMvt(layer)
+		for z := uint8(0); z <= 6; z++ {
+			for x := uint32(0); x < 1<<z; x++ {
+				for y := uint32(0); y < 1<<z; y++ {
+					switch (x*7 + y*3 + uint32(i)) % 5 {
+					case 0:
+						// absent
+					case 1:
+						tiles[Zxy{z, x, y}] = repeated
+					default:
+						tiles[Zxy{z, x, y}] = gzipMvt(layer, fmt.Sprintf("%s_%d_%d_%d", layer, z, x, y))
+					}
+				}
+			}
+		}
+		archives = append(archives, mvtArchive([]string{layer}, tiles))
+	}
+	return archives
+}
+
+func TestMergeSegmentsParallelMatchesSerial(t *testing.T) {
+	archives := manyTileArchives()
+	run := func(workers int) ([]EntryV3, []byte) {
+		var readers []io.ReaderAt
+		for _, a := range archives {
+			readers = append(readers, bytes.NewReader(a))
+		}
+		inputs, err, _ := loadLayerMergeInputs(readers)
+		assert.Nil(t, err)
+		var tileData bytes.Buffer
+		entries, _, _, err := mergeSegments(inputs, []string{"a", "b", "c"}, Gzip, workers, &tileData)
+		assert.Nil(t, err)
+		return entries, tileData.Bytes()
+	}
+	serialEntries, serialData := run(1)
+	assert.Greater(t, len(serialEntries), 1000)
+	for _, workers := range []int{2, 8, 32} {
+		entries, data := run(workers)
+		assert.Equal(t, serialEntries, entries, "workers=%d", workers)
+		assert.True(t, bytes.Equal(serialData, data), "workers=%d", workers)
+	}
+}
+
+func TestMergeSegmentsErrorDoesNotHang(t *testing.T) {
+	archives := manyTileArchives()
+	// a fourth input that clashes with "water" late in the archive
+	archives = append(archives, mvtArchive([]string{"water2"}, map[Zxy][]byte{
+		{6, 63, 62}: gzipMvt("water"), // present in "water" too: (63*7+62*3)%5 != 0
+	}))
+	var readers []io.ReaderAt
+	for _, a := range archives {
+		readers = append(readers, bytes.NewReader(a))
+	}
+	inputs, err, _ := loadLayerMergeInputs(readers)
+	assert.Nil(t, err)
+	_, _, _, err = mergeSegments(inputs, []string{"a", "b", "c", "d"}, Gzip, 4, io.Discard)
+	assert.ErrorContains(t, err, `layer "water" appears in both a and d`)
 }
 
 func TestMergeLayerTilesDuplicateLayerInTile(t *testing.T) {
