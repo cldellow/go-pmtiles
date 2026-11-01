@@ -123,9 +123,14 @@ func walkProtobuf(msg []byte, fn func(field uint64, value []byte) error) error {
 // writer per tile makes the merge spend most of its time in the allocator and GC.
 var gzipReaders sync.Pool
 var gzipWriters = sync.Pool{New: func() any {
-	w, _ := gzip.NewWriterLevel(io.Discard, gzip.DefaultCompression)
+	w, _ := gzip.NewWriterLevel(io.Discard, mergeGzipLevel)
 	return w
 }}
+
+// klauspost's levels 1-6 (and DefaultCompression, which is 5) use fast
+// encoders that made a merged basemap ~7% larger than zlib/libdeflate at
+// level 6. Level 7 matches their size, at ~35% more compression time.
+const mergeGzipLevel = 7
 
 func decompressTile(data []byte, compression Compression) ([]byte, error) {
 	switch compression {
