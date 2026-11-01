@@ -1,12 +1,14 @@
 package pmtiles
 
 import (
+	"errors"
 	"fmt"
 	"github.com/RoaringBitmap/roaring/roaring64"
 	"io"
 	"log"
 	"math"
 	"os"
+	"path/filepath"
 	"slices"
 	"sort"
 )
@@ -87,7 +89,7 @@ func prepareInputs(inputs []io.ReadSeeker) ([]HeaderV3, []mergeEntry, error, int
 			tmp := union.Clone()
 			tmp.And(tileset)
 			iz, ix, iy := IDToZxy(tmp.Minimum())
-			return nil, nil, fmt.Errorf("%d overlapping tiles, starting with %d %d %d. Inputs must be disjoint", tmp.GetCardinality(), iz, ix, iy), inputIdx
+			return nil, nil, &overlapError{count: tmp.GetCardinality(), z: iz, x: ix, y: iy}, inputIdx
 		}
 		union.Or(tileset)
 	}
@@ -196,6 +198,32 @@ func bounds(headers []HeaderV3) (int32, int32, int32, int32) {
 	return minLonE7, minLatE7, maxLonE7, maxLatE7
 }
 
+// mvtInputs reports whether every input archive contains MVT tiles, and whether they are all clustered.
+func mvtInputs(handles []io.ReadSeeker) (allMvt bool, allClustered bool) {
+	allClustered = true
+	for _, h := range handles {
+		buf := make([]byte, HeaderV3LenBytes)
+		if _, err := h.Seek(0, io.SeekStart); err != nil {
+			return false, false
+		}
+		if _, err := io.ReadFull(h, buf); err != nil {
+			return false, false
+		}
+		header, err := DeserializeHeader(buf)
+		if err != nil || header.TileType != Mvt {
+			return false, false
+		}
+		allClustered = allClustered && header.Clustered
+	}
+	for _, h := range handles {
+		h.Seek(0, io.SeekStart)
+	}
+	return true, allClustered
+}
+
+// Merge combines archives. Tile-disjoint archives are concatenated directly;
+// MVT archives whose tiles overlap but whose layers are disjoint have their
+// overlapping tiles combined layer-wise.
 func Merge(logger *log.Logger, inputs []string) error {
 	var handles []io.ReadSeeker
 
@@ -212,7 +240,26 @@ func Merge(logger *log.Logger, inputs []string) error {
 		defer f.Close()
 	}
 
+	output := inputs[len(inputs)-1]
+	for _, name := range inputs[:len(inputs)-1] {
+		if a, b := filepath.Clean(name), filepath.Clean(output); a == b {
+			return fmt.Errorf("output %s is also an input", output)
+		}
+	}
+
+	allMvt, allClustered := mvtInputs(handles)
+	if allMvt && !allClustered {
+		// the zero-copy path requires clustered inputs; the layer path does not.
+		logger.Printf("Inputs are not all clustered; merging as MVT layers")
+		return mergeLayers(logger, inputs[:len(inputs)-1], output)
+	}
+
 	headers, mergedEntries, err, errIdx := prepareInputs(handles)
+	var overlap *overlapError
+	if errors.As(err, &overlap) && allMvt {
+		logger.Printf("Inputs have overlapping tiles; merging disjoint MVT layers")
+		return mergeLayers(logger, inputs[:len(inputs)-1], output)
+	}
 	if err != nil {
 		return fmt.Errorf("%s: %w", inputs[errIdx], err)
 	}
@@ -261,26 +308,26 @@ func Merge(logger *log.Logger, inputs []string) error {
 
 	mergeOps := batchMergeEntries(renumberedEntries, len(headers))
 
-	output, err := os.Create(inputs[len(inputs)-1])
+	outfile, err := os.Create(output)
 	if err != nil {
 		return err
 	}
-	defer output.Close()
+	defer outfile.Close()
 
 	headerBytes := SerializeHeader(header)
-	_, err = output.Write(headerBytes)
+	_, err = outfile.Write(headerBytes)
 	if err != nil {
 		return err
 	}
-	_, err = output.Write(rootBytes)
+	_, err = outfile.Write(rootBytes)
 	if err != nil {
 		return err
 	}
 	firstHandle := handles[0]
 	firstHandle.Seek(int64(headers[0].MetadataOffset), io.SeekStart)
-	io.CopyN(output, firstHandle, int64(headers[0].MetadataLength))
+	io.CopyN(outfile, firstHandle, int64(headers[0].MetadataLength))
 
-	_, err = output.Write(leavesBytes)
+	_, err = outfile.Write(leavesBytes)
 	if err != nil {
 		return err
 	}
@@ -297,7 +344,7 @@ func Merge(logger *log.Logger, inputs []string) error {
 
 	for _, op := range mergeOps {
 		handle := handles[op.InputIdx]
-		_, err := io.CopyN(io.MultiWriter(output, bar), handle, int64(op.Length))
+		_, err := io.CopyN(io.MultiWriter(outfile, bar), handle, int64(op.Length))
 		if err != nil {
 			return err
 		}
