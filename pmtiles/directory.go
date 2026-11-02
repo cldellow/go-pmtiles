@@ -9,6 +9,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+
+	"github.com/klauspost/compress/zstd"
 )
 
 type Zxy struct {
@@ -229,6 +231,8 @@ func SerializeMetadata(metadata map[string]interface{}, compression Compression)
 		w.Write(jsonBytes)
 		w.Close()
 		return b.Bytes(), nil
+	} else if compression == Zstd {
+		return zstdEncoder.EncodeAll(jsonBytes, nil), nil
 	} else {
 		return nil, errors.New("compression not supported")
 	}
@@ -253,6 +257,16 @@ func DeserializeMetadataBytes(reader io.Reader, compression Compression) ([]byte
 			return nil, err
 		}
 		gzipReader.Close()
+	} else if compression == Zstd {
+		zr, err := zstd.NewReader(reader, zstd.WithDecoderConcurrency(1))
+		if err != nil {
+			return nil, err
+		}
+		defer zr.Close()
+		jsonBytes, err = io.ReadAll(zr)
+		if err != nil {
+			return nil, err
+		}
 	} else {
 		return nil, errors.New("compression not supported")
 	}
@@ -281,6 +295,8 @@ func SerializeEntries(entries []EntryV3, compression Compression) []byte {
 		w = &nopWriteCloser{&b}
 	} else if compression == Gzip {
 		w, _ = gzip.NewWriterLevel(&b, gzip.BestCompression)
+	} else if compression == Zstd {
+		w, _ = zstd.NewWriter(&b, zstd.WithEncoderConcurrency(1), zstd.WithEncoderLevel(zstd.SpeedBestCompression))
 	} else {
 		panic("Compression not supported")
 	}
@@ -329,6 +345,10 @@ func DeserializeEntries(data *bytes.Buffer, compression Compression) []EntryV3 {
 		reader = data
 	} else if compression == Gzip {
 		reader, _ = gzip.NewReader(data)
+	} else if compression == Zstd {
+		zr, _ := zstd.NewReader(data, zstd.WithDecoderConcurrency(1))
+		defer zr.Close()
+		reader = zr
 	} else {
 		panic("Compression not supported")
 	}

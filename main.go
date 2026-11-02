@@ -73,7 +73,8 @@ var cli struct {
 	} `cmd:"" help:"Create an archive from a larger archive for a subset of zoom levels or geographic region"`
 
 	Merge struct {
-		Archives []string `arg:"" name:"inputs_then_output" help:"One or more disjoint input archives, followed by the output filename."`
+		Archives        []string `arg:"" name:"inputs_then_output" help:"One or more disjoint input archives, followed by the output filename."`
+		TileCompression string   `help:"Tile compression of the output (gzip, zstd or none); defaults to the inputs' (or gzip if they differ). Only for MVT archives." enum:",gzip,zstd,none" default:""`
 	} `cmd:"" help:"Merge multiple disjoint archives into one: INPUT1.pmtiles INPUT2.pmtiles OUTPUT.pmtiles"`
 
 	Convert struct {
@@ -223,7 +224,7 @@ func main() {
 			logger.Fatalf("Failed to convert %s, %v", path, err)
 		}
 	case "merge <inputs_then_output>":
-		err := pmtiles.Merge(logger, cli.Merge.Archives)
+		err := pmtiles.Merge(logger, cli.Merge.Archives, cli.Merge.TileCompression)
 		if err != nil {
 			logger.Fatalf("Failed to merge, %v", err)
 		}

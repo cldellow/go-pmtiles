@@ -221,10 +221,42 @@ func mvtInputs(handles []io.ReadSeeker) (allMvt bool, allClustered bool) {
 	return true, allClustered
 }
 
+// sameTileCompression reports whether every input's tiles have compression c,
+// or, if c is UnknownCompression, the same compression as each other.
+func sameTileCompression(handles []io.ReadSeeker, c Compression) bool {
+	defer func() {
+		for _, h := range handles {
+			h.Seek(0, io.SeekStart)
+		}
+	}()
+	for _, h := range handles {
+		buf := make([]byte, HeaderV3LenBytes)
+		if _, err := h.Seek(0, io.SeekStart); err != nil {
+			return true // let prepareInputs report it
+		}
+		if _, err := io.ReadFull(h, buf); err != nil {
+			return true
+		}
+		header, err := DeserializeHeader(buf)
+		if err != nil {
+			return true
+		}
+		if c == UnknownCompression {
+			c = header.TileCompression
+		} else if header.TileCompression != c {
+			return false
+		}
+	}
+	return true
+}
+
 // Merge combines archives. Tile-disjoint archives are concatenated directly;
 // MVT archives whose tiles overlap but whose layers are disjoint have their
 // overlapping tiles combined layer-wise.
-func Merge(logger *log.Logger, inputs []string) error {
+//
+// tileCompression is the output's tile compression (gzip, zstd or none); empty
+// keeps the inputs'. Changing it decompresses and recompresses every tile.
+func Merge(logger *log.Logger, inputs []string, tileCompression string) error {
 	var handles []io.ReadSeeker
 
 	if len(inputs) < 2 {
@@ -247,18 +279,34 @@ func Merge(logger *log.Logger, inputs []string) error {
 		}
 	}
 
+	compression := UnknownCompression
+	if tileCompression != "" {
+		compression = stringToCompression(tileCompression)
+		if !layerMergeCompression(compression) {
+			return fmt.Errorf("unsupported tile compression %q; use gzip, zstd or none", tileCompression)
+		}
+	}
+
 	allMvt, allClustered := mvtInputs(handles)
+	if !sameTileCompression(handles, compression) {
+		if !allMvt {
+			return fmt.Errorf("only MVT archives can be recompressed, or merged from archives with different tile compressions")
+		}
+		// the zero-copy path can't recompress tiles; the layer path can.
+		logger.Printf("Recompressing tiles; merging as MVT layers")
+		return mergeLayers(logger, inputs[:len(inputs)-1], output, compression)
+	}
 	if allMvt && !allClustered {
 		// the zero-copy path requires clustered inputs; the layer path does not.
 		logger.Printf("Inputs are not all clustered; merging as MVT layers")
-		return mergeLayers(logger, inputs[:len(inputs)-1], output)
+		return mergeLayers(logger, inputs[:len(inputs)-1], output, compression)
 	}
 
 	headers, mergedEntries, err, errIdx := prepareInputs(handles)
 	var overlap *overlapError
 	if errors.As(err, &overlap) && allMvt {
 		logger.Printf("Inputs have overlapping tiles; merging disjoint MVT layers")
-		return mergeLayers(logger, inputs[:len(inputs)-1], output)
+		return mergeLayers(logger, inputs[:len(inputs)-1], output, compression)
 	}
 	if err != nil {
 		return fmt.Errorf("%s: %w", inputs[errIdx], err)

@@ -88,7 +88,7 @@ func TestMergeLayerTiles(t *testing.T) {
 
 	var tileData bytes.Buffer
 	logger := log.New(io.Discard, "", 0)
-	header, md, entries, err := mergeLayerTiles(logger, []io.ReaderAt{bytes.NewReader(a), bytes.NewReader(b)}, []string{"a", "b"}, &tileData)
+	header, md, entries, err := mergeLayerTiles(logger, []io.ReaderAt{bytes.NewReader(a), bytes.NewReader(b)}, []string{"a", "b"}, UnknownCompression, &tileData)
 	assert.Nil(t, err)
 	assert.Equal(t, 3, len(entries))
 	assert.Equal(t, uint64(3), header.AddressedTilesCount)
@@ -138,7 +138,7 @@ func TestMergeLayerTilesSplitsRuns(t *testing.T) {
 
 	var tileData bytes.Buffer
 	logger := log.New(io.Discard, "", 0)
-	_, _, entries, err := mergeLayerTiles(logger, []io.ReaderAt{bytes.NewReader(a), bytes.NewReader(b)}, []string{"a", "b"}, &tileData)
+	_, _, entries, err := mergeLayerTiles(logger, []io.ReaderAt{bytes.NewReader(a), bytes.NewReader(b)}, []string{"a", "b"}, UnknownCompression, &tileData)
 	assert.Nil(t, err)
 
 	id := ZxyToID(1, 1, 1)
@@ -160,7 +160,7 @@ func TestMergeLayerTilesDuplicateLayerInMetadata(t *testing.T) {
 		{0, 0, 0}: gzipMvt("parks"),
 	})
 	logger := log.New(io.Discard, "", 0)
-	_, md, entries, err := mergeLayerTiles(logger, []io.ReaderAt{bytes.NewReader(a), bytes.NewReader(b)}, []string{"a", "b"}, io.Discard)
+	_, md, entries, err := mergeLayerTiles(logger, []io.ReaderAt{bytes.NewReader(a), bytes.NewReader(b)}, []string{"a", "b"}, UnknownCompression, io.Discard)
 	assert.Nil(t, err)
 	assert.Equal(t, 2, len(entries))
 	var ids []string
@@ -199,7 +199,7 @@ func TestMergeLayerTilesDropsEmptyTiles(t *testing.T) {
 		{1, 1, 1}: gzipMvt("roads"),
 	})
 	logger := log.New(io.Discard, "", 0)
-	header, _, entries, err := mergeLayerTiles(logger, []io.ReaderAt{bytes.NewReader(a), bytes.NewReader(b)}, []string{"a", "b"}, io.Discard)
+	header, _, entries, err := mergeLayerTiles(logger, []io.ReaderAt{bytes.NewReader(a), bytes.NewReader(b)}, []string{"a", "b"}, UnknownCompression, io.Discard)
 	assert.Nil(t, err)
 	assert.Equal(t, uint64(2), header.AddressedTilesCount)
 	assert.Equal(t, 2, len(entries))
@@ -277,7 +277,7 @@ func TestMergeLayerTilesDuplicateLayerInTile(t *testing.T) {
 	a := mvtArchive([]string{"water"}, map[Zxy][]byte{{0, 0, 0}: gzipMvt("water")})
 	b := mvtArchive([]string{"roads"}, map[Zxy][]byte{{0, 0, 0}: gzipMvt("roads", "water")})
 	logger := log.New(io.Discard, "", 0)
-	_, _, _, err := mergeLayerTiles(logger, []io.ReaderAt{bytes.NewReader(a), bytes.NewReader(b)}, []string{"a", "b"}, io.Discard)
+	_, _, _, err := mergeLayerTiles(logger, []io.ReaderAt{bytes.NewReader(a), bytes.NewReader(b)}, []string{"a", "b"}, UnknownCompression, io.Discard)
 	assert.ErrorContains(t, err, `layer "water" appears in both a and b at tile 0 0 0`)
 }
 
@@ -287,7 +287,7 @@ func TestMergeLayerTilesRequiresMvt(t *testing.T) {
 	h.TileType = Png
 	a := fakeArchive(h, map[string]interface{}{}, map[Zxy][]byte{{0, 0, 0}: {1}}, false, Gzip)
 	logger := log.New(io.Discard, "", 0)
-	_, _, _, err := mergeLayerTiles(logger, []io.ReaderAt{bytes.NewReader(a), bytes.NewReader(a)}, []string{"a", "b"}, io.Discard)
+	_, _, _, err := mergeLayerTiles(logger, []io.ReaderAt{bytes.NewReader(a), bytes.NewReader(a)}, []string{"a", "b"}, UnknownCompression, io.Discard)
 	assert.ErrorContains(t, err, "requires mvt")
 }
 
@@ -321,7 +321,7 @@ func TestMergeEndToEndOverlappingMvt(t *testing.T) {
 	assert.Nil(t, os.WriteFile(pb, b, 0644))
 
 	logger := log.New(io.Discard, "", 0)
-	assert.Nil(t, Merge(logger, []string{pa, pb, out}))
+	assert.Nil(t, Merge(logger, []string{pa, pb, out}, ""))
 
 	result, err := os.ReadFile(out)
 	assert.Nil(t, err)
@@ -346,5 +346,135 @@ func TestMergeRejectsOutputAsInput(t *testing.T) {
 	a := mvtArchive([]string{"water"}, map[Zxy][]byte{{0, 0, 0}: gzipMvt("water")})
 	pa := filepath.Join(dir, "a.pmtiles")
 	assert.Nil(t, os.WriteFile(pa, a, 0644))
-	assert.ErrorContains(t, Merge(logger, []string{pa, pa}), "is also an input")
+	assert.ErrorContains(t, Merge(logger, []string{pa, pa}, ""), "is also an input")
+}
+
+func zstdMvt(layers ...string) []byte {
+	b, _ := compressTile(fakeMvt(layers...), Zstd)
+	return b
+}
+
+// withTileCompression returns a copy of archive whose header claims the given tile compression.
+func withTileCompression(archive []byte, c Compression) []byte {
+	out := append([]byte(nil), archive...)
+	h, _ := DeserializeHeader(out[:HeaderV3LenBytes])
+	h.TileCompression = c
+	copy(out, SerializeHeader(h))
+	return out
+}
+
+func TestCompressTileRoundTrip(t *testing.T) {
+	data := fakeMvt("water", "roads", "places")
+	for _, c := range []Compression{NoCompression, Gzip, Zstd} {
+		b, err := compressTile(data, c)
+		assert.Nil(t, err)
+		out, err := decompressTile(b, c)
+		assert.Nil(t, err)
+		assert.Equal(t, data, out)
+	}
+	b, _ := compressTile(data, Zstd)
+	assert.Equal(t, []byte{0x28, 0xb5, 0x2f, 0xfd}, b[:4])
+
+	// an empty tile still makes a frame, which decodes to nothing
+	b, _ = compressTile(nil, Zstd)
+	assert.NotEmpty(t, b)
+	out, err := decompressTile(b, Zstd)
+	assert.Nil(t, err)
+	assert.Empty(t, out)
+
+	_, err = decompressTile([]byte("not zstd"), Zstd)
+	assert.NotNil(t, err)
+}
+
+func writeArchives(t *testing.T, archives ...[]byte) (paths []string, out string) {
+	dir := t.TempDir()
+	for i, a := range archives {
+		p := filepath.Join(dir, fmt.Sprintf("in%d.pmtiles", i))
+		assert.Nil(t, os.WriteFile(p, a, 0644))
+		paths = append(paths, p)
+	}
+	return paths, filepath.Join(dir, "out.pmtiles")
+}
+
+func TestMergeZstd(t *testing.T) {
+	logger := log.New(io.Discard, "", 0)
+	zstdA := withTileCompression(mvtArchive([]string{"water"}, map[Zxy][]byte{
+		{0, 0, 0}: zstdMvt("water"),
+		{1, 0, 0}: zstdMvt("water"),
+		{1, 1, 0}: zstdMvt(), // empty
+	}), Zstd)
+	zstdB := withTileCompression(mvtArchive([]string{"roads"}, map[Zxy][]byte{
+		{0, 0, 0}: zstdMvt("roads"),
+		{2, 3, 3}: zstdMvt("roads"),
+	}), Zstd)
+	gzipB := mvtArchive([]string{"roads"}, map[Zxy][]byte{
+		{0, 0, 0}: gzipMvt("roads"),
+		{2, 3, 3}: gzipMvt("roads"),
+	})
+	want := map[uint64][]string{
+		ZxyToID(0, 0, 0): {"water", "roads"},
+		ZxyToID(1, 0, 0): {"water"},
+		ZxyToID(2, 3, 3): {"roads"},
+	}
+
+	cases := []struct {
+		name     string
+		inputs   [][]byte
+		flag     string
+		expected Compression
+	}{
+		{"zstd inputs stay zstd", [][]byte{zstdA, zstdB}, "", Zstd},
+		{"mixed inputs default to gzip", [][]byte{zstdA, gzipB}, "", Gzip},
+		{"mixed inputs to zstd", [][]byte{zstdA, gzipB}, "zstd", Zstd},
+		{"zstd inputs to gzip", [][]byte{zstdA, zstdB}, "gzip", Gzip},
+		{"zstd inputs to none", [][]byte{zstdA, zstdB}, "none", NoCompression},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			paths, out := writeArchives(t, tc.inputs...)
+			assert.Nil(t, Merge(logger, append(paths, out), tc.flag))
+			result, err := os.ReadFile(out)
+			assert.Nil(t, err)
+			h, _, tiles := readArchiveTiles(t, result)
+			assert.Equal(t, tc.expected, h.TileCompression)
+			assert.Equal(t, want, tiles)
+		})
+	}
+}
+
+func TestMergeRecompressesDisjointArchives(t *testing.T) {
+	logger := log.New(io.Discard, "", 0)
+	// disjoint inputs would otherwise be concatenated without decompressing
+	a := mvtArchive([]string{"water"}, map[Zxy][]byte{{0, 0, 0}: gzipMvt("water")})
+	b := mvtArchive([]string{"water"}, map[Zxy][]byte{{1, 0, 0}: gzipMvt("water")})
+	paths, out := writeArchives(t, a, b)
+	assert.Nil(t, Merge(logger, append(paths, out), "zstd"))
+	result, err := os.ReadFile(out)
+	assert.Nil(t, err)
+	h, _, tiles := readArchiveTiles(t, result)
+	assert.Equal(t, Compression(Zstd), h.TileCompression)
+	assert.Equal(t, map[uint64][]string{
+		ZxyToID(0, 0, 0): {"water"},
+		ZxyToID(1, 0, 0): {"water"},
+	}, tiles)
+
+	assert.ErrorContains(t, Merge(logger, append(paths, out), "brotli"), "unsupported tile compression")
+}
+
+func TestMergeLayerTilesZstdInternalCompression(t *testing.T) {
+	var h HeaderV3
+	h.Clustered = true
+	h.TileType = Mvt
+	a := fakeArchive(h, map[string]interface{}{"vector_layers": []interface{}{map[string]interface{}{"id": "water"}}},
+		map[Zxy][]byte{{0, 0, 0}: gzipMvt("water")}, true, Zstd)
+	hdr, md, tiles := readArchiveTiles(t, a)
+	assert.Equal(t, Compression(Zstd), hdr.InternalCompression)
+	assert.Equal(t, "water", md["vector_layers"].([]interface{})[0].(map[string]interface{})["id"])
+	assert.Equal(t, map[uint64][]string{ZxyToID(0, 0, 0): {"water"}}, tiles)
+
+	b := mvtArchive([]string{"roads"}, map[Zxy][]byte{{0, 0, 0}: gzipMvt("roads")})
+	logger := log.New(io.Discard, "", 0)
+	_, md, _, err := mergeLayerTiles(logger, []io.ReaderAt{bytes.NewReader(a), bytes.NewReader(b)}, []string{"a", "b"}, UnknownCompression, io.Discard)
+	assert.Nil(t, err)
+	assert.Equal(t, 2, len(md["vector_layers"].([]interface{})))
 }

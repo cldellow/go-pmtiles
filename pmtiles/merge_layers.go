@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/klauspost/compress/gzip"
+	"github.com/klauspost/compress/zstd"
 )
 
 // Merging of MVT archives whose tiles overlap but whose layers are disjoint
@@ -132,10 +133,28 @@ var gzipWriters = sync.Pool{New: func() any {
 // level 6. Level 7 matches their size, at ~35% more compression time.
 const mergeGzipLevel = 7
 
+// zstd's encoder and decoder are safe for concurrent EncodeAll/DecodeAll
+// calls, and keep their own pools of state.
+var zstdEncoder, _ = zstd.NewWriter(nil,
+	zstd.WithEncoderLevel(mergeZstdLevel),
+	zstd.WithEncoderConcurrency(runtime.GOMAXPROCS(0)),
+	zstd.WithZeroFrames(true))
+var zstdDecoder, _ = zstd.NewReader(nil,
+	zstd.WithDecoderConcurrency(runtime.GOMAXPROCS(0)),
+	zstd.WithDecoderMaxMemory(1<<30))
+
+// On a Nova Scotia basemap, klauspost's SpeedDefault (~zstd level 3, what
+// tilemaker writes) was 4% bigger than gzip level 7; SpeedBetterCompression
+// matches gzip's size, at about the same speed as SpeedDefault and ~30% faster
+// than gzip. SpeedBestCompression is 1% smaller but 3x slower.
+const mergeZstdLevel = zstd.SpeedBetterCompression
+
 func decompressTile(data []byte, compression Compression) ([]byte, error) {
 	switch compression {
 	case NoCompression:
 		return data, nil
+	case Zstd:
+		return zstdDecoder.DecodeAll(data, make([]byte, 0, 4*len(data)))
 	case Gzip:
 		var r *gzip.Reader
 		if v := gzipReaders.Get(); v != nil {
@@ -177,10 +196,17 @@ func compressTile(data []byte, compression Compression) ([]byte, error) {
 			return nil, err
 		}
 		return b.Bytes(), nil
+	case Zstd:
+		return zstdEncoder.EncodeAll(data, make([]byte, 0, len(data)/2+64)), nil
 	default:
 		c, _ := compressionToString(compression)
 		return nil, fmt.Errorf("tile compression %s not supported for layer merging", c)
 	}
+}
+
+// layerMergeCompressions are the tile compressions merging can read and write.
+func layerMergeCompression(c Compression) bool {
+	return c == NoCompression || c == Gzip || c == Zstd
 }
 
 // dedupeLayers keeps the first of several layer objects with the same key
@@ -302,12 +328,8 @@ func loadLayerMergeInputs(readers []io.ReaderAt) ([]*layerMergeInput, error, int
 		if h.TileType != Mvt {
 			return nil, fmt.Errorf("layer merging requires mvt tiles, got %s", tileTypeToString(h.TileType)), idx
 		}
-		if idx > 0 && h.TileCompression != inputs[0].header.TileCompression {
-			c1, _ := compressionToString(h.TileCompression)
-			c2, _ := compressionToString(inputs[0].header.TileCompression)
-			return nil, fmt.Errorf("tile compression %s does not match %s", c1, c2), idx
-		}
-		if h.TileCompression != NoCompression && h.TileCompression != Gzip {
+		// Inputs may differ in tile compression: each is decompressed with its own.
+		if !layerMergeCompression(h.TileCompression) {
 			c, _ := compressionToString(h.TileCompression)
 			return nil, fmt.Errorf("tile compression %s not supported for layer merging", c), idx
 		}
@@ -410,12 +432,23 @@ var noTile = offsetLen{Offset: math.MaxUint64}
 // buildTile reads a job's source tiles and produces its output tile.
 func buildTile(inputs []*layerMergeInput, names []string, compression Compression, j *mergeJob) ([]byte, error) {
 	if len(j.seg.sources) == 1 {
-		raw, err := readTile(inputs[j.seg.sources[0]], j.ents[0])
+		in := inputs[j.seg.sources[0]]
+		raw, err := readTile(in, j.ents[0])
 		if err != nil {
 			return nil, err
 		}
-		// tilemaker writes empty tiles, which gzip to ~20 bytes. Drop them, as
-		// tile-join and tile-smush do.
+		if in.header.TileCompression != compression {
+			part, err := decompressTile(raw, in.header.TileCompression)
+			if err != nil {
+				return nil, fmt.Errorf("%s: %w", names[j.seg.sources[0]], err)
+			}
+			if len(part) == 0 {
+				return nil, nil
+			}
+			return compressTile(part, compression)
+		}
+		// tilemaker writes empty tiles, which gzip to ~20 bytes (zstd to ~9).
+		// Drop them, as tile-join and tile-smush do.
 		if len(raw) < 64 {
 			part, err := decompressTile(raw, compression)
 			if err != nil {
@@ -436,7 +469,7 @@ func buildTile(inputs []*layerMergeInput, names []string, compression Compressio
 		if err != nil {
 			return nil, err
 		}
-		part, err := decompressTile(raw, compression)
+		part, err := decompressTile(raw, inputs[idx].header.TileCompression)
 		if err != nil {
 			return nil, fmt.Errorf("%s: %w", names[idx], err)
 		}
@@ -611,14 +644,40 @@ func mergeSegments(inputs []*layerMergeInput, names []string, compression Compre
 
 // mergeLayerTiles writes the merged tile data section to tileData, returning the output
 // header (without section offsets), merged metadata and directory entries.
-func mergeLayerTiles(logger *log.Logger, readers []io.ReaderAt, names []string, tileData io.Writer) (HeaderV3, map[string]interface{}, []EntryV3, error) {
+//
+// Tiles are written with the given compression; UnknownCompression means the
+// inputs' compression, if they all agree, and gzip otherwise.
+func mergeLayerTiles(logger *log.Logger, readers []io.ReaderAt, names []string, compression Compression, tileData io.Writer) (HeaderV3, map[string]interface{}, []EntryV3, error) {
 	var header HeaderV3
 	inputs, err, errIdx := loadLayerMergeInputs(readers)
 	if err != nil {
 		return header, nil, nil, fmt.Errorf("%s: %w", names[errIdx], err)
 	}
 
-	compression := inputs[0].header.TileCompression
+	if compression == UnknownCompression {
+		compression = inputs[0].header.TileCompression
+		for _, in := range inputs {
+			if in.header.TileCompression != compression {
+				compression = Gzip
+				break
+			}
+		}
+	}
+	if !layerMergeCompression(compression) {
+		c, _ := compressionToString(compression)
+		return header, nil, nil, fmt.Errorf("tile compression %s not supported for layer merging", c)
+	}
+	var transcoded []string
+	for idx, in := range inputs {
+		if in.header.TileCompression != compression {
+			c, _ := compressionToString(in.header.TileCompression)
+			transcoded = append(transcoded, fmt.Sprintf("%s (%s)", names[idx], c))
+		}
+	}
+	if len(transcoded) > 0 {
+		c, _ := compressionToString(compression)
+		logger.Printf("Recompressing tiles to %s from %s", c, strings.Join(transcoded, ", "))
+	}
 	maxZooms := make(map[uint8]bool)
 	for _, in := range inputs {
 		lastEntry := in.entries[len(in.entries)-1]
@@ -677,7 +736,7 @@ func mergeLayerTiles(logger *log.Logger, readers []io.ReaderAt, names []string, 
 }
 
 // mergeLayers merges MVT archives whose tiles may overlap but whose layers are disjoint.
-func mergeLayers(logger *log.Logger, inputNames []string, output string) error {
+func mergeLayers(logger *log.Logger, inputNames []string, output string, compression Compression) error {
 	var readers []io.ReaderAt
 	for _, name := range inputNames {
 		f, err := os.Open(name)
@@ -695,7 +754,7 @@ func mergeLayers(logger *log.Logger, inputNames []string, output string) error {
 	defer os.Remove(tmpfile.Name())
 	defer tmpfile.Close()
 
-	header, metadata, entries, err := mergeLayerTiles(logger, readers, inputNames, tmpfile)
+	header, metadata, entries, err := mergeLayerTiles(logger, readers, inputNames, compression, tmpfile)
 	if err != nil {
 		return err
 	}

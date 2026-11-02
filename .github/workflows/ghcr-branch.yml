@@ -34,7 +34,7 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
       - name: Test merge
-        run: go test ./pmtiles -run 'Merge|Mvt|Dedupe'
+        run: go test ./pmtiles -run 'Merge|Mvt|Dedupe|Compress'
       - uses: docker/build-push-action@v6
         with:
           context: .
