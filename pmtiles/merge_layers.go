@@ -1,6 +1,7 @@
 package pmtiles
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/binary"
 	"errors"
@@ -9,9 +10,9 @@ import (
 	"log"
 	"math"
 	"os"
-	"path/filepath"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -695,7 +696,7 @@ func mergeLayerTiles(logger *log.Logger, readers []io.ReaderAt, names []string, 
 	}
 
 	start := time.Now()
-	entries, contents, stats, err := mergeSegments(inputs, names, compression, runtime.GOMAXPROCS(0), tileData)
+	entries, contents, stats, err := mergeSegments(inputs, names, compression, mergeWorkers(), tileData)
 	if err != nil {
 		return header, nil, nil, err
 	}
@@ -736,6 +737,12 @@ func mergeLayerTiles(logger *log.Logger, readers []io.ReaderAt, names []string, 
 }
 
 // mergeLayers merges MVT archives whose tiles may overlap but whose layers are disjoint.
+//
+// The tile data is written straight into the output, after a reserved first
+// 16 KiB; the metadata and leaf directories follow it, and the header and root
+// directory are written into the reserved space last. The spec only requires
+// the header to come first and the root directory to end within 16 KiB, and
+// this avoids writing all the tile data to a temporary file and copying it.
 func mergeLayers(logger *log.Logger, inputNames []string, output string, compression Compression) error {
 	var readers []io.ReaderAt
 	for _, name := range inputNames {
@@ -744,22 +751,38 @@ func mergeLayers(logger *log.Logger, inputNames []string, output string, compres
 			return err
 		}
 		defer f.Close()
+		if mergeReadsRandom() {
+			adviseRandom(f)
+		}
 		readers = append(readers, f)
 	}
 
-	tmpfile, err := os.CreateTemp(filepath.Dir(output), ".pmtiles-merge-*")
+	out, err := os.Create(output)
 	if err != nil {
 		return err
 	}
-	defer os.Remove(tmpfile.Name())
-	defer tmpfile.Close()
+	ok := false
+	defer func() {
+		out.Close()
+		if !ok {
+			os.Remove(output)
+		}
+	}()
 
-	header, metadata, entries, err := mergeLayerTiles(logger, readers, inputNames, compression, tmpfile)
+	const reserved = 16384
+	if _, err := out.Seek(reserved, io.SeekStart); err != nil {
+		return err
+	}
+	tileData := bufio.NewWriterSize(out, 8<<20)
+	header, metadata, entries, err := mergeLayerTiles(logger, readers, inputNames, compression, tileData)
 	if err != nil {
 		return err
 	}
+	if err := tileData.Flush(); err != nil {
+		return err
+	}
 
-	rootBytes, leavesBytes, _ := BuildDirectories(entries, 16384-HeaderV3LenBytes, Gzip)
+	rootBytes, leavesBytes, _ := BuildDirectories(entries, reserved-HeaderV3LenBytes, Gzip)
 	metadataBytes, err := SerializeMetadata(metadata, Gzip)
 	if err != nil {
 		return err
@@ -767,29 +790,40 @@ func mergeLayers(logger *log.Logger, inputNames []string, output string, compres
 
 	header.RootOffset = HeaderV3LenBytes
 	header.RootLength = uint64(len(rootBytes))
-	header.MetadataOffset = header.RootOffset + header.RootLength
+	header.TileDataOffset = reserved
+	header.MetadataOffset = header.TileDataOffset + header.TileDataLength
 	header.MetadataLength = uint64(len(metadataBytes))
 	header.LeafDirectoryOffset = header.MetadataOffset + header.MetadataLength
 	header.LeafDirectoryLength = uint64(len(leavesBytes))
-	header.TileDataOffset = header.LeafDirectoryOffset + header.LeafDirectoryLength
 
-	out, err := os.Create(output)
-	if err != nil {
-		return err
-	}
-	defer out.Close()
-
-	for _, b := range [][]byte{SerializeHeader(header), rootBytes, metadataBytes, leavesBytes} {
+	// The file position is now the end of the tile data.
+	for _, b := range [][]byte{metadataBytes, leavesBytes} {
 		if _, err := out.Write(b); err != nil {
 			return err
 		}
 	}
-	if _, err := tmpfile.Seek(0, io.SeekStart); err != nil {
+	if _, err := out.WriteAt(append(SerializeHeader(header), rootBytes...), 0); err != nil {
 		return err
 	}
-	bar := defaultBytesProgressbar(logger, int64(header.TileDataLength), "writing tile data")
-	if _, err := io.Copy(io.MultiWriter(out, bar), tmpfile); err != nil {
+	if err := out.Close(); err != nil {
 		return err
 	}
-	return out.Close()
+	ok = true
+	return nil
+}
+
+// mergeWorkers is how many tiles are read, combined and compressed at once.
+// PMTILES_MERGE_WORKERS overrides it (for benchmarking).
+func mergeWorkers() int {
+	if n, err := strconv.Atoi(os.Getenv("PMTILES_MERGE_WORKERS")); err == nil && n > 0 {
+		return n
+	}
+	return runtime.GOMAXPROCS(0)
+}
+
+// mergeReadsRandom says whether to tell the kernel the inputs are read at
+// random, which turns off readahead. PMTILES_MERGE_FADVISE=random enables it
+// (for benchmarking).
+func mergeReadsRandom() bool {
+	return os.Getenv("PMTILES_MERGE_FADVISE") == "random"
 }

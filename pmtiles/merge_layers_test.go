@@ -478,3 +478,50 @@ func TestMergeLayerTilesZstdInternalCompression(t *testing.T) {
 	assert.Nil(t, err)
 	assert.Equal(t, 2, len(md["vector_layers"].([]interface{})))
 }
+
+// The layer merge writes the tile data straight after a reserved 16 KiB, and
+// the metadata and leaf directories after the tile data.
+func TestMergeLayersLayout(t *testing.T) {
+	logger := log.New(io.Discard, "", 0)
+	// Verify wants real bounds; the test archives have none.
+	withBounds := func(archive []byte) []byte {
+		out := append([]byte(nil), archive...)
+		h, _ := DeserializeHeader(out[:HeaderV3LenBytes])
+		h.MinLonE7, h.MinLatE7, h.MaxLonE7, h.MaxLatE7 = -10e7, -10e7, 10e7, 10e7
+		copy(out, SerializeHeader(h))
+		return out
+	}
+	a := mvtArchive([]string{"water"}, map[Zxy][]byte{
+		{0, 0, 0}: gzipMvt("water"),
+		{1, 0, 0}: gzipMvt("water"),
+	})
+	b := mvtArchive([]string{"roads"}, map[Zxy][]byte{
+		{0, 0, 0}: gzipMvt("roads"),
+		{2, 3, 3}: gzipMvt("roads"),
+	})
+	paths, out := writeArchives(t, withBounds(a), withBounds(b))
+	assert.Nil(t, Merge(logger, append(paths, out), ""))
+	assert.Nil(t, Verify(logger, out))
+
+	result, err := os.ReadFile(out)
+	assert.Nil(t, err)
+	h, _, tiles := readArchiveTiles(t, result)
+	assert.Equal(t, uint64(HeaderV3LenBytes), h.RootOffset)
+	assert.Equal(t, uint64(16384), h.TileDataOffset)
+	assert.Equal(t, h.TileDataOffset+h.TileDataLength, h.MetadataOffset)
+	assert.Equal(t, h.MetadataOffset+h.MetadataLength, h.LeafDirectoryOffset)
+	assert.Equal(t, int(h.LeafDirectoryOffset+h.LeafDirectoryLength), len(result))
+	assert.Equal(t, map[uint64][]string{
+		ZxyToID(0, 0, 0): {"water", "roads"},
+		ZxyToID(1, 0, 0): {"water"},
+		ZxyToID(2, 3, 3): {"roads"},
+	}, tiles)
+
+	// A failed merge leaves no output behind.
+	bad := filepath.Join(t.TempDir(), "bad.pmtiles")
+	assert.Nil(t, os.WriteFile(bad, []byte("not a pmtiles archive"), 0644))
+	failed := filepath.Join(t.TempDir(), "failed.pmtiles")
+	assert.NotNil(t, Merge(logger, []string{paths[0], bad, failed}, ""))
+	_, err = os.Stat(failed)
+	assert.True(t, os.IsNotExist(err))
+}
