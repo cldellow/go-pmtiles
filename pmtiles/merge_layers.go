@@ -751,9 +751,6 @@ func mergeLayers(logger *log.Logger, inputNames []string, output string, compres
 			return err
 		}
 		defer f.Close()
-		if mergeReadsRandom() {
-			adviseRandom(f)
-		}
 		readers = append(readers, f)
 	}
 
@@ -812,18 +809,14 @@ func mergeLayers(logger *log.Logger, inputNames []string, output string, compres
 	return nil
 }
 
-// mergeWorkers is how many tiles are read, combined and compressed at once.
-// PMTILES_MERGE_WORKERS overrides it (for benchmarking).
+// mergeWorkers is how many tiles are read, combined and compressed at once:
+// 4 per CPU, so the CPUs stay busy while some workers wait on reads. Input
+// tiles are read at random, because tilemaker doesn't write them in tile ID
+// order. On north-america (4 CPUs), 16 or 32 workers merged 5-7% faster than
+// 4. PMTILES_MERGE_WORKERS overrides it.
 func mergeWorkers() int {
 	if n, err := strconv.Atoi(os.Getenv("PMTILES_MERGE_WORKERS")); err == nil && n > 0 {
 		return n
 	}
-	return runtime.GOMAXPROCS(0)
-}
-
-// mergeReadsRandom says whether to tell the kernel the inputs are read at
-// random, which turns off readahead. PMTILES_MERGE_FADVISE=random enables it
-// (for benchmarking).
-func mergeReadsRandom() bool {
-	return os.Getenv("PMTILES_MERGE_FADVISE") == "random"
+	return 4 * runtime.GOMAXPROCS(0)
 }
