@@ -316,6 +316,9 @@ func Merge(logger *log.Logger, inputs []string, tileCompression string) error {
 	if err != nil {
 		return err
 	}
+	if len(renumberedEntries) == 0 {
+		return errors.New("no input has any tiles")
+	}
 
 	tmp := make([]EntryV3, len(renumberedEntries))
 	for i := range renumberedEntries {

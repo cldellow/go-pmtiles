@@ -315,29 +315,30 @@ func mergeLayerMetadata(metadatas []map[string]interface{}) map[string]interface
 	return result
 }
 
-func loadLayerMergeInputs(readers []io.ReaderAt) ([]*layerMergeInput, error, int) {
-	var inputs []*layerMergeInput
+// Inputs without tiles are left out, and their indexes returned in skipped:
+// e.g. a buildings layer of an area that has no buildings.
+func loadLayerMergeInputs(readers []io.ReaderAt) (inputs []*layerMergeInput, kept []int, skipped []int, err error, errIdx int) {
 	for idx, r := range readers {
 		buf := make([]byte, HeaderV3LenBytes)
 		if _, err := r.ReadAt(buf, 0); err != nil {
-			return nil, err, idx
+			return nil, nil, nil, err, idx
 		}
 		h, err := DeserializeHeader(buf)
 		if err != nil {
-			return nil, err, idx
+			return nil, nil, nil, err, idx
 		}
 		if h.TileType != Mvt {
-			return nil, fmt.Errorf("layer merging requires mvt tiles, got %s", tileTypeToString(h.TileType)), idx
+			return nil, nil, nil, fmt.Errorf("layer merging requires mvt tiles, got %s", tileTypeToString(h.TileType)), idx
 		}
 		// Inputs may differ in tile compression: each is decompressed with its own.
 		if !layerMergeCompression(h.TileCompression) {
 			c, _ := compressionToString(h.TileCompression)
-			return nil, fmt.Errorf("tile compression %s not supported for layer merging", c), idx
+			return nil, nil, nil, fmt.Errorf("tile compression %s not supported for layer merging", c), idx
 		}
 
 		metadata, err := DeserializeMetadata(io.NewSectionReader(r, int64(h.MetadataOffset), int64(h.MetadataLength)), h.InternalCompression)
 		if err != nil {
-			return nil, fmt.Errorf("reading metadata: %w", err), idx
+			return nil, nil, nil, fmt.Errorf("reading metadata: %w", err), idx
 		}
 
 		var entries []EntryV3
@@ -351,20 +352,22 @@ func loadLayerMergeInputs(readers []io.ReaderAt) ([]*layerMergeInput, error, int
 				entries = append(entries, e)
 			})
 		if err != nil {
-			return nil, err, idx
+			return nil, nil, nil, err, idx
 		}
 		sort.Slice(entries, func(i, j int) bool { return entries[i].TileID < entries[j].TileID })
 		if len(entries) == 0 {
-			return nil, errors.New("archive has no tiles"), idx
+			skipped = append(skipped, idx)
+			continue
 		}
 
 		inputs = append(inputs, &layerMergeInput{reader: r, header: h, metadata: metadata, entries: entries})
+		kept = append(kept, idx)
 	}
 
 	// Several inputs may declare the same layer (e.g. a layer split across two
 	// tilemaker configs by area), so the metadata isn't checked here. Each
 	// combined tile is checked for a layer coming from two inputs instead.
-	return inputs, nil, 0
+	return inputs, kept, skipped, nil, 0
 }
 
 // nextSegment returns the next segment at or after t, or ok=false when all inputs are exhausted.
@@ -650,10 +653,21 @@ func mergeSegments(inputs []*layerMergeInput, names []string, compression Compre
 // inputs' compression, if they all agree, and gzip otherwise.
 func mergeLayerTiles(logger *log.Logger, readers []io.ReaderAt, names []string, compression Compression, tileData io.Writer) (HeaderV3, map[string]interface{}, []EntryV3, error) {
 	var header HeaderV3
-	inputs, err, errIdx := loadLayerMergeInputs(readers)
+	inputs, kept, skipped, err, errIdx := loadLayerMergeInputs(readers)
 	if err != nil {
 		return header, nil, nil, fmt.Errorf("%s: %w", names[errIdx], err)
 	}
+	for _, idx := range skipped {
+		logger.Printf("Skipping %s: it has no tiles", names[idx])
+	}
+	if len(inputs) == 0 {
+		return header, nil, nil, errors.New("no input has any tiles")
+	}
+	keptNames := make([]string, len(kept))
+	for i, idx := range kept {
+		keptNames[i] = names[idx]
+	}
+	names = keptNames
 
 	if compression == UnknownCompression {
 		compression = inputs[0].header.TileCompression

@@ -8,6 +8,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -240,7 +241,7 @@ func TestMergeSegmentsParallelMatchesSerial(t *testing.T) {
 		for _, a := range archives {
 			readers = append(readers, bytes.NewReader(a))
 		}
-		inputs, err, _ := loadLayerMergeInputs(readers)
+		inputs, _, _, err, _ := loadLayerMergeInputs(readers)
 		assert.Nil(t, err)
 		var tileData bytes.Buffer
 		entries, _, _, err := mergeSegments(inputs, []string{"a", "b", "c"}, Gzip, workers, &tileData)
@@ -266,7 +267,7 @@ func TestMergeSegmentsErrorDoesNotHang(t *testing.T) {
 	for _, a := range archives {
 		readers = append(readers, bytes.NewReader(a))
 	}
-	inputs, err, _ := loadLayerMergeInputs(readers)
+	inputs, _, _, err, _ := loadLayerMergeInputs(readers)
 	assert.Nil(t, err)
 	_, _, _, err = mergeSegments(inputs, []string{"a", "b", "c", "d"}, Gzip, 4, io.Discard)
 	assert.ErrorContains(t, err, `layer "water" appears in both a and d`)
@@ -524,4 +525,34 @@ func TestMergeLayersLayout(t *testing.T) {
 	assert.NotNil(t, Merge(logger, []string{paths[0], bad, failed}, ""))
 	_, err = os.Stat(failed)
 	assert.True(t, os.IsNotExist(err))
+}
+
+// An input with no tiles (e.g. the buildings layer of an area with none) is
+// skipped; if no input has tiles, the merge fails.
+func TestMergeSkipsEmptyInputs(t *testing.T) {
+	var logs bytes.Buffer
+	logger := log.New(&logs, "", 0)
+	water := mvtArchive([]string{"water"}, map[Zxy][]byte{
+		{0, 0, 0}: gzipMvt("water"),
+		{1, 0, 0}: gzipMvt("water"),
+	})
+	empty := mvtArchive([]string{"buildings"}, map[Zxy][]byte{})
+	roads := mvtArchive([]string{"roads"}, map[Zxy][]byte{
+		{0, 0, 0}: gzipMvt("roads"),
+	})
+	paths, out := writeArchives(t, water, empty, roads)
+	assert.Nil(t, Merge(logger, append(paths, out), ""))
+	assert.True(t, strings.Contains(logs.String(), "Skipping "+paths[1]+": it has no tiles"))
+	result, err := os.ReadFile(out)
+	assert.Nil(t, err)
+	_, _, tiles := readArchiveTiles(t, result)
+	assert.Equal(t, map[uint64][]string{
+		ZxyToID(0, 0, 0): {"water", "roads"},
+		ZxyToID(1, 0, 0): {"water"},
+	}, tiles)
+
+	paths, out = writeArchives(t, empty, empty)
+	err = Merge(logger, append(paths, out), "")
+	assert.NotNil(t, err)
+	assert.True(t, strings.Contains(err.Error(), "no input has any tiles"))
 }
