@@ -1,9 +1,12 @@
-FROM golang:1.25-alpine AS builder
+# Cross-compiles on the build machine, so multi-arch images need no emulation.
+FROM --platform=$BUILDPLATFORM golang:1.25-alpine AS builder
 COPY . /workspace
 WORKDIR /workspace
 ENV CGO_ENABLED=0
 ARG VERSION
-RUN go build \
+ARG TARGETOS
+ARG TARGETARCH
+RUN GOOS=$TARGETOS GOARCH=$TARGETARCH go build \
   -trimpath \
   -ldflags "\
     -s -w \
