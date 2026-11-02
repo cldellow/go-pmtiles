@@ -29,7 +29,8 @@ var (
 )
 
 var cli struct {
-	Quiet bool `help:"Silence logging and progress output" short:"q"`
+	Quiet      bool `help:"Silence logging and progress output" short:"q"`
+	NoProgress bool `help:"Hide progress bars, but keep logging (e.g. for CI logs)"`
 
 	Show struct {
 		Path       string `arg:""`
@@ -132,6 +133,9 @@ func main() {
 	ctx := kong.Parse(&cli)
 	if cli.Quiet {
 		logger.SetOutput(io.Discard)
+	}
+	if cli.NoProgress {
+		pmtiles.ShowProgress = false
 	}
 
 	switch ctx.Command() {
