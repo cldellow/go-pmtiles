@@ -556,3 +556,52 @@ func TestMergeSkipsEmptyInputs(t *testing.T) {
 	assert.NotNil(t, err)
 	assert.True(t, strings.Contains(err.Error(), "no input has any tiles"))
 }
+
+// tileData returns the stored bytes of each addressed tile.
+func tileData(t *testing.T, archive []byte) map[uint64][]byte {
+	h, err := DeserializeHeader(archive[:HeaderV3LenBytes])
+	assert.Nil(t, err)
+	result := make(map[uint64][]byte)
+	IterateEntries(h, func(o, l uint64) ([]byte, error) { return archive[o : o+l], nil }, func(e EntryV3) {
+		start := h.TileDataOffset + e.Offset
+		result[e.TileID] = archive[start : start+uint64(e.Length)]
+	})
+	return result
+}
+
+func TestMergeZstdJoinsFrames(t *testing.T) {
+	logger := log.New(io.Discard, "", 0)
+	water, roads, places := zstdMvt("water"), zstdMvt("roads"), gzipMvt("places")
+	a := withTileCompression(mvtArchive([]string{"water"}, map[Zxy][]byte{
+		{0, 0, 0}: water,
+		{1, 0, 0}: water,
+	}), Zstd)
+	b := withTileCompression(mvtArchive([]string{"roads"}, map[Zxy][]byte{
+		{0, 0, 0}: roads,
+		{1, 0, 0}: zstdMvt(), // empty: left out of the joined tile
+		{1, 1, 0}: roads,
+	}), Zstd)
+	c := mvtArchive([]string{"places"}, map[Zxy][]byte{
+		{1, 1, 0}: places,
+	})
+	paths, out := writeArchives(t, a, b, c)
+	assert.Nil(t, Merge(logger, append(paths, out), "zstd"))
+	result, err := os.ReadFile(out)
+	assert.Nil(t, err)
+
+	h, _, tiles := readArchiveTiles(t, result)
+	assert.Equal(t, Compression(Zstd), h.TileCompression)
+	assert.Equal(t, map[uint64][]string{
+		ZxyToID(0, 0, 0): {"water", "roads"},
+		ZxyToID(1, 0, 0): {"water"},
+		ZxyToID(1, 1, 0): {"roads", "places"},
+	}, tiles)
+
+	data := tileData(t, result)
+	// zstd sources' frames are copied as they are, not recompressed
+	assert.Equal(t, append(append([]byte(nil), water...), roads...), data[ZxyToID(0, 0, 0)])
+	assert.Equal(t, water, data[ZxyToID(1, 0, 0)])
+	// a gzip source gets a zstd frame of its own
+	assert.True(t, bytes.HasPrefix(data[ZxyToID(1, 1, 0)], roads))
+	assert.Greater(t, len(data[ZxyToID(1, 1, 0)]), len(roads))
+}
