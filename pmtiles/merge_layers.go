@@ -466,7 +466,16 @@ func buildTile(inputs []*layerMergeInput, names []string, compression Compressio
 	}
 
 	// An MVT Tile is a list of layers, so concatenating tiles merges them.
-	var combined []byte
+	//
+	// And a zstd stream of several frames decodes to their contents, joined:
+	// so for zstd output, the zstd source tiles are joined as they are, not
+	// decompressed, joined and recompressed. Recompressing was most of the
+	// merge's time. Each frame compresses only its own layers, but that cost
+	// nothing measurable: the tiles came out the same size as recompressing
+	// at the level tilemaker writes. They are still decompressed, to check
+	// their layers and to drop the empty ones.
+	joinFrames := compression == Zstd
+	var combined, frames []byte
 	var layerOwner map[string]int
 	for i, idx := range j.seg.sources {
 		raw, err := readTile(inputs[idx], j.ents[i])
@@ -476,6 +485,16 @@ func buildTile(inputs []*layerMergeInput, names []string, compression Compressio
 		part, err := decompressTile(raw, inputs[idx].header.TileCompression)
 		if err != nil {
 			return nil, fmt.Errorf("%s: %w", names[idx], err)
+		}
+		if len(part) == 0 {
+			continue
+		}
+		if joinFrames {
+			if inputs[idx].header.TileCompression == Zstd {
+				frames = append(frames, raw...)
+			} else {
+				frames = zstdEncoder.EncodeAll(part, frames)
+			}
 		}
 		layerNames, err := mvtLayerNames(part)
 		if err != nil {
@@ -492,7 +511,12 @@ func buildTile(inputs []*layerMergeInput, names []string, compression Compressio
 			}
 			layerOwner[name] = idx
 		}
-		combined = append(combined, part...)
+		if !joinFrames {
+			combined = append(combined, part...)
+		}
+	}
+	if joinFrames {
+		return frames, nil // nil if every source was empty
 	}
 	if len(combined) == 0 {
 		return nil, nil
