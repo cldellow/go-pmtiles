@@ -279,7 +279,10 @@ func finalize(logger *log.Logger, resolve *resolver, header HeaderV3, tmpfile *o
 
 	header.Clustered = true
 	header.InternalCompression = Gzip
-	if header.TileType == Mvt {
+	// MBTiles vector tiles are gzipped, though their metadata often doesn't
+	// say so: default to gzip only when the compression is unknown, and keep
+	// one the input declared (cluster keeps a zstd archive's zstd).
+	if header.TileType == Mvt && header.TileCompression == UnknownCompression {
 		header.TileCompression = Gzip
 	}
 
